@@ -27,7 +27,7 @@ Results go to:
 | Fake hardcoded secret | `server.js` |
 | Command injection, XSS, `eval` | `server.js` |
 | Outdated `express` and `lodash` | `package.json` |
-| End-of-life base image (`node:14-slim`) | `Dockerfile` |
+| End-of-life base image (`node:16-slim`) | `Dockerfile` |
 
 ## Run the scans locally
 
