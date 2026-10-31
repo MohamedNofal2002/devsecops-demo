@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: read
-  security-events: write # upload results to the GitHub Security tab
+  security-events: write
 
 jobs:
   security-scan:
