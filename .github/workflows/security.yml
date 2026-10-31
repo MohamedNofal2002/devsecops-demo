@@ -1,0 +1,135 @@
+name: Security Pipeline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write # upload results to the GitHub Security tab
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare output folders
+        run: mkdir -p sarif zap && chmod 777 sarif zap
+
+      - name: Secret scan (Gitleaks)
+        id: secrets
+        continue-on-error: true
+        run: >
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1
+          detect --no-git --source /repo --redact
+          --report-format sarif --report-path /repo/sarif/gitleaks.sarif
+
+      - name: Code scan (Semgrep SAST)
+        id: sast
+        continue-on-error: true
+        run: >
+          docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep:1.183.0
+          semgrep scan --config p/javascript --config p/nodejsscan --metrics=off
+          --error --sarif -o sarif/semgrep.sarif
+
+      - name: Dependency scan (Trivy)
+        id: deps
+        continue-on-error: true
+        run: >
+          docker run --rm -v "$PWD:/src" aquasec/trivy:0.76.1
+          fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1
+          --format sarif -o /src/sarif/trivy-deps.sarif /src
+
+      - name: Build Docker image
+        run: docker build -t demo-app:ci .
+
+      - name: Container scan (Trivy)
+        id: image
+        continue-on-error: true
+        run: >
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/src"
+          aquasec/trivy:0.76.1 image --severity CRITICAL --exit-code 1
+          --format sarif -o /src/sarif/trivy-image.sarif demo-app:ci
+
+      - name: Dynamic scan of running app (OWASP ZAP baseline)
+        id: dast
+        continue-on-error: true
+        run: |
+          docker run -d --name app -p 3000:3000 demo-app:ci
+          sleep 5
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:3000 -r zap-report.html -J zap-report.json
+
+      - name: Upload Gitleaks results
+        if: always() && hashFiles('sarif/gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: sarif/gitleaks.sarif, category: secrets }
+
+      - name: Upload Semgrep results
+        if: always() && hashFiles('sarif/semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: sarif/semgrep.sarif, category: sast }
+
+      - name: Upload dependency results
+        if: always() && hashFiles('sarif/trivy-deps.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: sarif/trivy-deps.sarif, category: dependencies }
+
+      - name: Upload container results
+        if: always() && hashFiles('sarif/trivy-image.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: sarif/trivy-image.sarif, category: container }
+
+      - name: Save reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            sarif/
+            zap/
+
+      - name: Summary
+        if: always()
+        run: |
+          icon() { [ "$1" = "success" ] && echo "✅ Passed" || echo "❌ Issues found"; }
+          {
+            echo "## Security scan results"
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Secrets (Gitleaks) | $(icon '${{ steps.secrets.outcome }}') |"
+            echo "| Code (Semgrep) | $(icon '${{ steps.sast.outcome }}') |"
+            echo "| Dependencies (Trivy) | $(icon '${{ steps.deps.outcome }}') |"
+            echo "| Container (Trivy) | $(icon '${{ steps.image.outcome }}') |"
+            echo "| Running app (ZAP) | $(icon '${{ steps.dast.outcome }}') |"
+            echo ""
+            echo "Details: **Security → Code scanning** tab, and the \`security-reports\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Slack alert
+        if: always() && env.SLACK_WEBHOOK_URL != ''
+        run: |
+          failed=""
+          for s in "Secrets:${{ steps.secrets.outcome }}" "Code:${{ steps.sast.outcome }}" \
+                   "Dependencies:${{ steps.deps.outcome }}" "Container:${{ steps.image.outcome }}" \
+                   "Running app:${{ steps.dast.outcome }}"; do
+            [ "${s#*:}" = "failure" ] && failed="$failed ${s%%:*},"
+          done
+          if [ -n "$failed" ]; then
+            text=":rotating_light: Security issues found in ${{ github.repository }}:${failed%,}. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            text=":white_check_mark: All security checks passed for ${{ github.repository }}"
+          fi
+          curl -sf -X POST -H 'Content-Type: application/json' \
+            --data "$(jq -n --arg t "$text" '{text: $t}')" "$SLACK_WEBHOOK_URL"
+
+      - name: Fail if any check found issues
+        if: >
+          steps.secrets.outcome == 'failure' || steps.sast.outcome == 'failure' ||
+          steps.deps.outcome == 'failure' || steps.image.outcome == 'failure' ||
+          steps.dast.outcome == 'failure'
+        run: exit 1
